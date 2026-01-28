@@ -18,6 +18,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    COLOCATED = auto()  # Pipelined draft/target with SM partitioning
     NGRAM = auto()
     NONE = auto()
 
@@ -46,8 +47,11 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_colocated(self) -> bool:
+        return self == SpeculativeAlgorithm.COLOCATED
+
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_colocated()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -92,6 +96,12 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_colocated():
+            from sglang.srt.speculative.colocated_standalone_worker import (
+                ColocatedStandaloneWorker,
+            )
+
+            return ColocatedStandaloneWorker
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
