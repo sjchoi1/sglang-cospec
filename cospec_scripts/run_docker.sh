@@ -14,6 +14,7 @@ apt-get install -y python3 python3-pip git
 pip3 install --upgrade pip
 cd /workspace/sglang/python
 pip3 install -e ".[all]"
+cd /workspace/sglang
 exec bash
 EOF
 
@@ -21,7 +22,7 @@ EOF
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "Reusing existing container: $CONTAINER_NAME"
     docker start "$CONTAINER_NAME" 2>/dev/null || true
-    docker exec -it "$CONTAINER_NAME" bash
+    docker exec -it -w /workspace/sglang "$CONTAINER_NAME" bash
 else
     echo "Creating new container: $CONTAINER_NAME"
     docker run -it \
