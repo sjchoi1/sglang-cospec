@@ -1247,7 +1247,7 @@ class Scheduler(
             if draft_queue.is_empty():
                 if verify_spec_info is not None:
                     # Just run verify
-                    verify_result = self.model_worker._run_verify(verify_queue, verify_spec_info)
+                    verify_result = self.model_worker.forward_verify_only(verify_queue, verify_spec_info)
                     self.process_batch_result(verify_queue, verify_result)
                     if self.colocated_phase == 0:
                         self.queue_b_spec_info = None
@@ -1285,11 +1285,11 @@ class Scheduler(
     def _colocated_flush_pending_verifies(self):
         """Flush any pending spec_info by running verifies synchronously."""
         if self.queue_a_spec_info is not None and not self.queue_a.is_empty():
-            result = self.model_worker._run_verify(self.queue_a, self.queue_a_spec_info)
+            result = self.model_worker.forward_verify_only(self.queue_a, self.queue_a_spec_info)
             self.process_batch_result(self.queue_a, result)
             self.queue_a_spec_info = None
         if self.queue_b_spec_info is not None and not self.queue_b.is_empty():
-            result = self.model_worker._run_verify(self.queue_b, self.queue_b_spec_info)
+            result = self.model_worker.forward_verify_only(self.queue_b, self.queue_b_spec_info)
             self.process_batch_result(self.queue_b, result)
             self.queue_b_spec_info = None
 

@@ -221,6 +221,10 @@ class ColocatedStandaloneWorker(EAGLEWorker):
 
         return spec_info, verify_result
 
+    def forward_verify_only(self, batch, spec_info):
+        """Run verify phase only (when draft queue is empty)."""
+        return self._run_verify(batch, spec_info)
+
     def forward_draft_only(self, batch):
         """Run draft phase only (first iteration for a queue)."""
         with self.draft_tp_context(
