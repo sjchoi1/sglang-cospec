@@ -2261,6 +2261,87 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_cooperation_info=self.dp_cooperation_info,
         )
 
+    def extract_reqs(self, indices):
+        """Remove requests at given indices and return them as a new ScheduleBatch."""
+        if not indices:
+            return ScheduleBatch(reqs=[], batch_is_full=False)
+
+        keep_indices = [i for i in range(len(self.reqs)) if i not in set(indices)]
+        extract_indices = list(indices)
+
+        extract_indices_device = torch.tensor(extract_indices, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+
+        new_batch = ScheduleBatch(
+            reqs=[self.reqs[i] for i in extract_indices],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            forward_mode=self.forward_mode,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            batch_is_full=False,
+            device=self.device,
+        )
+
+        if self.req_pool_indices is not None:
+            new_batch.req_pool_indices = self.req_pool_indices[extract_indices_device]
+        if self.seq_lens is not None:
+            new_batch.seq_lens = self.seq_lens[extract_indices_device]
+        if self.seq_lens_cpu is not None:
+            new_batch.seq_lens_cpu = self.seq_lens_cpu[extract_indices]
+        if self.orig_seq_lens is not None:
+            new_batch.orig_seq_lens = self.orig_seq_lens[extract_indices_device]
+        if self.output_ids is not None:
+            new_batch.output_ids = self.output_ids[extract_indices_device]
+        if self.input_ids is not None:
+            new_batch.input_ids = self.input_ids[extract_indices_device]
+        # Compute prefix_lens from request data (needed for draft_extend_after_decode)
+        new_batch.prefix_lens = [len(r.prefix_indices) for r in new_batch.reqs]
+
+        new_batch.seq_lens_sum = new_batch.seq_lens.sum().item() if new_batch.seq_lens is not None else 0
+        new_batch.return_logprob = any(req.return_logprob for req in new_batch.reqs)
+        new_batch.has_stream = any(req.stream for req in new_batch.reqs)
+        new_batch.has_grammar = any(req.grammar for req in new_batch.reqs)
+
+        if self.sampling_info is not None:
+            # Create fresh sampling info for the extracted batch
+            new_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                new_batch,
+                self.model_config.vocab_size,
+            )
+
+        # Extract spec_info if present and sizes are consistent
+        orig_batch_size = len(keep_indices) + len(extract_indices)
+        if (self.spec_info is not None
+            and hasattr(self.spec_info, 'topk_p')
+            and self.spec_info.topk_p is not None
+            and len(self.spec_info.topk_p) >= orig_batch_size):
+            # topk_p size should match original batch size (before extraction)
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+            new_batch.spec_info = EagleDraftInput(
+                topk_p=self.spec_info.topk_p[extract_indices_device],
+                topk_index=self.spec_info.topk_index[extract_indices_device],
+                hidden_states=self.spec_info.hidden_states[extract_indices_device],
+                verified_id=self.spec_info.verified_id[extract_indices_device],
+                num_tokens_per_batch=self.spec_info.num_tokens_per_batch,
+                num_tokens_for_logprob_per_batch=self.spec_info.num_tokens_for_logprob_per_batch,
+            )
+            # Copy draft extend fields if present
+            if self.spec_info.seq_lens_for_draft_extend is not None:
+                new_batch.spec_info.seq_lens_for_draft_extend = self.spec_info.seq_lens_for_draft_extend[extract_indices_device]
+            if self.spec_info.seq_lens_for_draft_extend_cpu is not None:
+                new_batch.spec_info.seq_lens_for_draft_extend_cpu = self.spec_info.seq_lens_for_draft_extend_cpu[extract_indices]
+            if self.spec_info.req_pool_indices_for_draft_extend is not None:
+                new_batch.spec_info.req_pool_indices_for_draft_extend = self.spec_info.req_pool_indices_for_draft_extend[extract_indices_device]
+
+        # Now filter self to keep only keep_indices
+        self.filter_batch(keep_indices=keep_indices)
+
+        return new_batch
+
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size

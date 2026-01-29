@@ -9,6 +9,7 @@ Pipeline:
 """
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -24,7 +25,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
-from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
+from sglang.srt.utils import empty_context, is_cuda
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -135,7 +136,6 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         self.sm_partition_enabled = False
 
         # Get SM partition ratio from environment or use default
-        import os
         draft_ratio = float(os.environ.get("COSPEC_DRAFT_SM_RATIO", "0.2"))
 
         try:
@@ -162,85 +162,7 @@ class ColocatedStandaloneWorker(EAGLEWorker):
                 f"Falling back to sequential execution with stream overlap."
             )
 
-        # Pipeline state
-        self.pending_batch: Optional[ScheduleBatch] = None
-        self.pending_spec_info = None
-        self.pipeline_active = False
-
         logger.info("ColocatedStandaloneWorker initialized")
-
-    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        """Run pipelined speculative decoding forward.
-
-        Pipeline: draft(current_batch) || verify(previous_batch)
-
-        For extend (prefill) batches, we run sequentially (no pipeline).
-        For decode batches, we pipeline draft and verify phases.
-        """
-        # For extend batches, use standard sequential flow
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            return self._forward_extend(batch)
-
-        # For decode batches, use pipelined flow
-        return self._forward_decode_pipelined(batch)
-
-    def _forward_extend(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        """Handle extend (prefill) batches - sequential execution."""
-        # Flush any pending pipeline state first
-        result = self._flush_pipeline()
-
-        # Run standard extend flow from parent class
-        logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(batch)
-
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            self.forward_draft_extend(
-                batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
-            )
-
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            num_accepted_tokens=0,
-            can_run_cuda_graph=False,
-        )
-
-    def _forward_decode_pipelined(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        """Handle decode batches with pipelined draft/verify."""
-        verify_result = None
-
-        # Step 1: If we have a pending batch, start verification on target_stream
-        if self.pending_batch is not None:
-            with torch.cuda.stream(self.target_stream):
-                verify_result = self._run_verify(
-                    self.pending_batch, self.pending_spec_info
-                )
-
-        # Step 2: Run draft on draft_stream
-        with torch.cuda.stream(self.draft_stream):
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                spec_info = self.draft(batch)
-
-        # Step 3: Synchronize both streams
-        self.draft_stream.synchronize()
-        self.target_stream.synchronize()
-
-        # Step 4: Store current batch for next iteration's verification
-        self.pending_batch = batch
-        self.pending_spec_info = spec_info
-        self.pipeline_active = True
-
-        # Step 5: If no previous result, run verify now (first iteration)
-        if verify_result is None:
-            verify_result = self._run_verify(batch, spec_info)
-            self.pending_batch = None
-            self.pending_spec_info = None
-            self.pipeline_active = False
-
-        return verify_result
 
     def _run_verify(self, batch: ScheduleBatch, spec_info) -> GenerationBatchResult:
         """Run verification phase."""
@@ -258,6 +180,17 @@ class ColocatedStandaloneWorker(EAGLEWorker):
             ):
                 self.forward_draft_extend_after_decode(batch)
 
+        # Clone spec_info tensors to detach from CUDA graph output buffers.
+        # Without this, the next CUDA graph replay (for a different batch)
+        # would overwrite these shared output buffers.
+        if batch.spec_info is not None:
+            if batch.spec_info.topk_p is not None:
+                batch.spec_info.topk_p = batch.spec_info.topk_p.clone()
+            if batch.spec_info.topk_index is not None:
+                batch.spec_info.topk_index = batch.spec_info.topk_index.clone()
+            if batch.spec_info.hidden_states is not None:
+                batch.spec_info.hidden_states = batch.spec_info.hidden_states.clone()
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.verified_id,
@@ -266,16 +199,31 @@ class ColocatedStandaloneWorker(EAGLEWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    def _flush_pipeline(self) -> Optional[GenerationBatchResult]:
-        """Flush any pending batch in the pipeline."""
-        if not self.pipeline_active or self.pending_batch is None:
-            return None
+    def forward_dual_batch_decode(self, batch_draft, batch_verify, spec_info_verify):
+        """draft(batch_draft) || verify(batch_verify) concurrently on separate streams."""
+        default_stream = torch.cuda.current_stream()
+        self.target_stream.wait_stream(default_stream)
+        self.draft_stream.wait_stream(default_stream)
 
-        # Complete the pending verification
-        result = self._run_verify(self.pending_batch, self.pending_spec_info)
+        # Launch verify on target_stream
+        with torch.cuda.stream(self.target_stream):
+            verify_result = self._run_verify(batch_verify, spec_info_verify)
 
-        self.pending_batch = None
-        self.pending_spec_info = None
-        self.pipeline_active = False
+        # Launch draft on draft_stream
+        with torch.cuda.stream(self.draft_stream):
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                spec_info = self.draft(batch_draft)
 
-        return result
+        self.draft_stream.synchronize()
+        self.target_stream.synchronize()
+
+        return spec_info, verify_result
+
+    def forward_draft_only(self, batch):
+        """Run draft phase only (first iteration for a queue)."""
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            return self.draft(batch)

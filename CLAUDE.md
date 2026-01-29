@@ -11,3 +11,6 @@
 ```
 445afae2abc15d578d3107d37a9b57ebc49e5e46
 ```
+
+## Testing 
+For claude to run code by itself use docker exec sglang-cospec 

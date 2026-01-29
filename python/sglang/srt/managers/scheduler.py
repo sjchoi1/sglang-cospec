@@ -727,6 +727,16 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
+        # Colocated two-queue state: disable overlap since we manage our own pipeline
+        if self.spec_algorithm.is_colocated():
+            self.enable_overlap = False
+            self.queue_a: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+            self.queue_b: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+            self.queue_a_spec_info = None
+            self.queue_b_spec_info = None
+            self.colocated_phase = 0  # 0 = A drafts/B verifies, 1 = swapped
+            self.colocated_min_bs = int(os.environ.get("COLOCATED_MIN_BATCH_SIZE", "4"))
+
     def init_chunked_prefill(self):
         # Init chunked prefill
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1138,6 +1148,236 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+    @DynamicGradMode()
+    def event_loop_colocated(self):
+        """Two-queue colocated speculative decoding event loop."""
+        while True:
+            # Receive requests
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            # 1. Try prefill (full GPU, sequential)
+            prefill_batch = self.get_new_batch_prefill()
+            if prefill_batch is not None:
+                # Clear stale prefill info from consecutive prefills
+                self.temp_prefill_info = None
+
+                # Flush pending spec_info by running pending verifies synchronously
+                self._colocated_flush_pending_verifies()
+
+                # Run prefill
+                result = self.run_batch(prefill_batch)
+                self.process_batch_result(prefill_batch, result)
+
+                # Merge prefill batch into running_batch, then assign to queues
+                prefill_batch.filter_batch()
+                if not prefill_batch.is_empty() and not prefill_batch.is_prefill_only:
+                    if self.running_batch.is_empty():
+                        self.running_batch = prefill_batch
+                    else:
+                        self.running_batch.merge_batch(prefill_batch)
+                self.last_batch = None
+
+                # Assign new requests from running_batch to smaller queue
+                self._colocated_assign_new_reqs()
+                continue
+
+            # 2. Filter finished requests from both queues
+            if not self.queue_a.is_empty():
+                self.queue_a.filter_batch(v1_spec_info_filtered=True)
+                if self.queue_a.is_empty():
+                    self.queue_a_spec_info = None
+            if not self.queue_b.is_empty():
+                self.queue_b.filter_batch(v1_spec_info_filtered=True)
+                if self.queue_b.is_empty():
+                    self.queue_b_spec_info = None
+
+            total_bs = len(self.queue_a.reqs) + len(self.queue_b.reqs)
+
+            # 3. Idle
+            if total_bs == 0:
+                self.last_batch = None
+                self.self_check_during_idle()
+                continue
+
+            self.forward_ct += 1
+
+            # 4. Small batch fallback: merge + sequential
+            if total_bs < self.colocated_min_bs:
+                merged = self._colocated_merge_queues()
+                merged = self.update_running_batch(merged)
+                if merged.is_empty():
+                    self.last_batch = None
+                    continue
+                result = self.run_batch(merged)
+                self.process_batch_result(merged, result)
+                self.last_batch = merged
+                # Split back into two queues
+                self._colocated_split_back(merged)
+                continue
+
+            # 5. Two-queue concurrent execution
+            if self.colocated_phase == 0:
+                draft_queue = self.queue_a
+                verify_queue = self.queue_b
+                draft_spec_info_attr = 'queue_a_spec_info'
+                verify_spec_info = self.queue_b_spec_info
+            else:
+                draft_queue = self.queue_b
+                verify_queue = self.queue_a
+                draft_spec_info_attr = 'queue_b_spec_info'
+                verify_spec_info = self.queue_a_spec_info
+
+            # Prepare decode for draft queue
+            if not draft_queue.is_empty():
+                draft_queue = self.update_running_batch(draft_queue)
+                if self.colocated_phase == 0:
+                    self.queue_a = draft_queue
+                else:
+                    self.queue_b = draft_queue
+
+            if draft_queue.is_empty() and verify_queue.is_empty():
+                self.last_batch = None
+                continue
+
+            # Handle case where one queue is empty
+            if draft_queue.is_empty():
+                if verify_spec_info is not None:
+                    # Just run verify
+                    verify_result = self.model_worker._run_verify(verify_queue, verify_spec_info)
+                    self.process_batch_result(verify_queue, verify_result)
+                    if self.colocated_phase == 0:
+                        self.queue_b_spec_info = None
+                    else:
+                        self.queue_a_spec_info = None
+                self.colocated_phase = 1 - self.colocated_phase
+                continue
+
+            if verify_queue.is_empty() or verify_spec_info is None:
+                # Just run draft
+                spec_info = self.model_worker.forward_draft_only(draft_queue)
+                setattr(self, draft_spec_info_attr, spec_info)
+
+                # If verify_queue had pending spec_info but is empty, clear it
+                if verify_queue.is_empty():
+                    if self.colocated_phase == 0:
+                        self.queue_b_spec_info = None
+                    else:
+                        self.queue_a_spec_info = None
+            else:
+                # Both queues active with pending verify
+                spec_info, verify_result = self.model_worker.forward_dual_batch_decode(
+                    draft_queue, verify_queue, verify_spec_info
+                )
+                self.process_batch_result(verify_queue, verify_result)
+                setattr(self, draft_spec_info_attr, spec_info)
+                # Clear verify queue's spec_info (it was consumed)
+                if self.colocated_phase == 0:
+                    self.queue_b_spec_info = None
+                else:
+                    self.queue_a_spec_info = None
+
+            self.colocated_phase = 1 - self.colocated_phase
+
+    def _colocated_flush_pending_verifies(self):
+        """Flush any pending spec_info by running verifies synchronously."""
+        if self.queue_a_spec_info is not None and not self.queue_a.is_empty():
+            result = self.model_worker._run_verify(self.queue_a, self.queue_a_spec_info)
+            self.process_batch_result(self.queue_a, result)
+            self.queue_a_spec_info = None
+        if self.queue_b_spec_info is not None and not self.queue_b.is_empty():
+            result = self.model_worker._run_verify(self.queue_b, self.queue_b_spec_info)
+            self.process_batch_result(self.queue_b, result)
+            self.queue_b_spec_info = None
+
+    def _colocated_assign_new_reqs(self):
+        """After prefill, load-balance new requests across both queues.
+
+        Uses extract_reqs to split the batch. At this point spec_info tensors
+        are freshly created by forward_draft_extend and have correct sizes.
+        """
+        if self.running_batch.is_empty():
+            return
+
+        n = len(self.running_batch.reqs)
+        a_len = len(self.queue_a.reqs)
+        b_len = len(self.queue_b.reqs)
+
+        # Compute how many go to each queue to balance sizes
+        n_a = max(0, min(n, (n + b_len - a_len) // 2))
+        n_b = n - n_a
+
+        if n_b > 0 and n_a > 0:
+            # Extract n_b reqs into a separate batch for queue_b
+            indices_b = list(range(n_a, n))
+            batch_b = self.running_batch.extract_reqs(indices_b)
+            # running_batch now has only the first n_a reqs
+            if self.queue_a.is_empty():
+                self.queue_a = self.running_batch
+            else:
+                self.queue_a.merge_batch(self.running_batch)
+            if self.queue_b.is_empty():
+                self.queue_b = batch_b
+            else:
+                self.queue_b.merge_batch(batch_b)
+        elif n_a > 0:
+            if self.queue_a.is_empty():
+                self.queue_a = self.running_batch
+            else:
+                self.queue_a.merge_batch(self.running_batch)
+        else:
+            if self.queue_b.is_empty():
+                self.queue_b = self.running_batch
+            else:
+                self.queue_b.merge_batch(self.running_batch)
+
+        # Clear running_batch
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+
+    def _colocated_merge_queues(self) -> ScheduleBatch:
+        """Merge both queues into a single batch for fallback."""
+        # Flush any pending spec_info first
+        self._colocated_flush_pending_verifies()
+
+        if self.queue_a.is_empty():
+            merged = self.queue_b
+            self.queue_b = ScheduleBatch(reqs=[], batch_is_full=False)
+            return merged
+        if self.queue_b.is_empty():
+            merged = self.queue_a
+            self.queue_a = ScheduleBatch(reqs=[], batch_is_full=False)
+            return merged
+
+        self.queue_a.merge_batch(self.queue_b)
+        merged = self.queue_a
+        self.queue_a = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.queue_b = ScheduleBatch(reqs=[], batch_is_full=False)
+        return merged
+
+    def _colocated_split_back(self, merged: ScheduleBatch):
+        """Split merged batch back into two queues."""
+        if merged.is_empty():
+            self.queue_a = ScheduleBatch(reqs=[], batch_is_full=False)
+            self.queue_b = ScheduleBatch(reqs=[], batch_is_full=False)
+            return
+
+        n = len(merged.reqs)
+        half = n // 2
+        if half == 0:
+            # All in queue_a
+            self.queue_a = merged
+            self.queue_b = ScheduleBatch(reqs=[], batch_is_full=False)
+        else:
+            indices_b = list(range(half, n))
+            self.queue_b = merged.extract_reqs(indices_b)
+            self.queue_a = merged
+
+        self.queue_a_spec_info = None
+        self.queue_b_spec_info = None
+        self.colocated_phase = 0
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -3059,7 +3299,9 @@ def run_scheduler_process(
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_pdmux:
+            if scheduler.spec_algorithm.is_colocated():
+                scheduler.event_loop_colocated()
+            elif scheduler.enable_pdmux:
                 scheduler.event_loop_pdmux()
             elif server_args.pp_size > 1:
                 scheduler.event_loop_pp()
