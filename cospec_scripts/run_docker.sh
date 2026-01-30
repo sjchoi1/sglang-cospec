@@ -10,10 +10,12 @@ IMAGE="nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04"
 read -r -d '' SETUP_COMMANDS << 'EOF' || true
 set -e
 apt-get update
-apt-get install -y python3 python3-pip git
+apt-get install -y python3 python3-pip git python-is-python3 numactl
 pip3 install --upgrade pip
 cd /workspace/sglang/python
 pip3 install -e ".[all]"
+pip3 install --upgrade sgl_kernel
+cd /workspace/sglang/cospec_scripts && bash build_libsmctrl.sh
 cd /workspace/sglang
 exec bash
 EOF
@@ -32,6 +34,8 @@ else
         --ulimit memlock=-1 \
         --ulimit stack=67108864 \
         -v "$SGLANG_ROOT":/workspace/sglang \
+        -v "$HOME/workspace/huggingface/hub":/root/.cache/huggingface/hub \
+        -e HF_HOME=/root/.cache/huggingface \
         -w /workspace/sglang \
         "$IMAGE" \
         bash -c "$SETUP_COMMANDS"

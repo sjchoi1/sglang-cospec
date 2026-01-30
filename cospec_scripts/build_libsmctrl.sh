@@ -16,6 +16,9 @@ gcc -shared -fPIC -o build/libsmctrl.so src/libsmctrl.c -lcuda -I/usr/local/cuda
 
 if [ $? -eq 0 ]; then
     echo "Successfully built: $LIBSMCTRL_DIR/build/libsmctrl.so"
+    cp "$LIBSMCTRL_DIR/build/libsmctrl.so" /usr/local/lib/
+    ldconfig
+    echo "Installed to /usr/local/lib/libsmctrl.so"
 else
     echo "Build failed!"
     exit 1

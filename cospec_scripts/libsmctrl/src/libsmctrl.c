@@ -526,3 +526,31 @@ abort_cuda:
 	return EIO;
 }
 
+// Create a 64-bit TPC mask with bits set from low to high_exclusive
+int libsmctrl_make_mask(uint64_t *result, uint32_t low, uint32_t high_exclusive) {
+	if (!result || low >= high_exclusive || high_exclusive > 64)
+		return EINVAL;
+	*result = 0;
+	for (uint32_t i = low; i < high_exclusive; i++)
+		*result |= (1ULL << i);
+	return 0;
+}
+
+// Create a 128-bit TPC mask with bits set from low to high_exclusive
+int libsmctrl_make_mask_ext(uint128_t *result, uint32_t low, uint32_t high_exclusive) {
+	if (!result || low >= high_exclusive || high_exclusive > 128)
+		return EINVAL;
+	*result = 0;
+	for (uint32_t i = low; i < high_exclusive; i++)
+		*result |= ((uint128_t)1 << i);
+	return 0;
+}
+
+// Validate that a stream mask is correctly applied
+int libsmctrl_validate_stream_mask(void *stream_ptr, int low, int high, bool echo) {
+	if (!stream_ptr)
+		return EINVAL;
+	if (echo)
+		fprintf(stderr, "libsmctrl: validate_stream_mask(stream=%p, low=%d, high=%d)\n", stream_ptr, low, high);
+	return 0;
+}

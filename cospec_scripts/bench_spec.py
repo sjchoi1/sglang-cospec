@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--algorithm", type=str, default="STANDALONE")
     parser.add_argument("--num-steps", type=int, default=3)
     parser.add_argument("--topk", type=int, default=1)
-    parser.add_argument("--num-draft-tokens", type=int, default=3)
+    parser.add_argument("--num-draft-tokens", type=int, default=4)
     parser.add_argument("--num-prompts", type=int, default=10)
     parser.add_argument("--max-tokens", type=int, default=128)
     args = parser.parse_args()
