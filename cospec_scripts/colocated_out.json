@@ -1,0 +1,42 @@
+[
+  {
+    "prompt": "Describe the process of photosynthesis.",
+    "text": " Photosynthesis is the process by which green plants, algae, and some bacteria convert light energy into chemical energy. The process occurs in the chloroplasts of plant cells, where chlorophyll captures sunlight. The overall equation for photosynthesis is 6CO2 + 6H2O + light energy \u2192 C6H12O6 + 6O2. This means that carbon dioxide and water, in the presence of light energy, are converted into glucose and oxygen. The process can be divided into two main stages: the light-dependent reactions and the light-independent reactions (Calvin cycle). In the light-dependent reactions, water"
+  },
+  {
+    "prompt": "Explain quantum computing in simple terms.",
+    "text": " Quantum computing is a type of computing that uses the principles of quantum mechanics to perform operations on data. Unlike classical computers, which use bits as the basic unit of information (which can be either 0 or 1), quantum computers use qubits. Qubits can exist in multiple states at the same time due to a phenomenon called superposition. This allows quantum computers to process a vast number of possibilities simultaneously, making them potentially much faster than classical computers for certain tasks. Additionally, qubits can be entangled, meaning the state of one qubit can instantaneously affect the state of another, no matter the distance between them. This ent"
+  },
+  {
+    "prompt": "Explain the theory of relativity.",
+    "text": " The theory of relativity, developed by Albert Einstein, is a fundamental concept in physics that revolutionized our understanding of space, time, and gravity. It consists of two main parts: the special theory of relativity (1905) and the general theory of relativity (1915). \n\nSpecial relativity deals with objects moving at constant speeds, particularly those approaching the speed of light. It introduces the idea that the laws of physics are the same for all non-accelerating observers, and that the speed of light in a vacuum is constant, regardless of the motion of the light source or observer. This leads"
+  },
+  {
+    "prompt": "How does a rocket engine work?",
+    "text": " What is the difference between a solid and liquid rocket engine? What are the advantages and disadvantages of each? What are the different types of rocket engines? What are the different types of propellants used in rocket engines? What are the different types of rocket engines? What are the different types of propellants used in rocket engines? What are the different types of rocket engines? What are the different types of propellants used in rocket engines? What are the different types of rocket engines? What are the different types of propellants used in rocket engines? What are the different types of rocket engines? What are the different types of"
+  },
+  {
+    "prompt": "Tell me about the history of the internet.",
+    "text": " The internet has a long and complex history, with its origins dating back to the 1960s. Here's a brief overview of its development:\n\n1. **ARPANET (1960s-1970s)**: The concept of a networked communication system was first explored by the U.S. Department of Defense's Advanced Research Projects Agency (ARPA) in the 1960s. This led to the creation of ARPANET, the first wide-area packet-switched network, which connected multiple research institutions and government agencies. The first message was sent over ARPANET in "
+  },
+  {
+    "prompt": "What are prime numbers?",
+    "text": " Can you give an example of a prime number and explain why it is prime?\n\nPrime numbers are numbers greater than 1 that have no divisors other than 1 and themselves. For example, 7 is a prime number because its only divisors are 1 and 7. No other number divides 7 without leaving a remainder.\n\nWhat is a composite number? Can you give an example and explain why it is composite?\n\nA composite number is a number greater than 1 that is not prime, meaning it has divisors other than 1 and itself. For example, 6 is a composite number because it can be divided by"
+  },
+  {
+    "prompt": "What are the benefits of exercise?",
+    "text": " How does exercise affect the body? What are the different types of exercise? How often should I exercise? What are the risks of not exercising? How can I start an exercise routine?\n\nExercise offers numerous benefits, including improving physical health, mental well-being, and overall quality of life. It helps in maintaining a healthy weight, strengthening the heart, lungs, and muscles, and reducing the risk of chronic diseases like diabetes and heart disease. Additionally, it can enhance mood, reduce stress, and improve sleep quality. \n\nExercise affects the body in several ways. It increases cardiovascular endurance, strengthens muscles and bones, improves flexibility, and boosts the immune"
+  },
+  {
+    "prompt": "What is machine learning?",
+    "text": " What are the different types of machine learning? What are the key concepts in machine learning? What are the applications of machine learning? What are the challenges in machine learning? What are the best practices in machine learning? What are the tools and libraries used in machine learning? What are the ethical considerations in machine learning? What are the future trends in machine learning? What are the differences between machine learning and artificial intelligence? What are the differences between machine learning and deep learning? What are the differences between machine learning and data science? What are the differences between machine learning and statistics? What are the differences between machine learning and computer science? What are"
+  },
+  {
+    "prompt": "What is the capital of France?",
+    "text": " What is the largest country in the world by area? What is the chemical symbol for water? What is the square root of 64? What is the capital of Japan? What is the largest planet in our solar system? What is the boiling point of water in Celsius? What is the smallest prime number? What is the currency of the United States? What is the main component of the Earth's atmosphere?\n\nThe capital of France is Paris. The largest country in the world by area is Russia. The chemical symbol for water is H\u2082O. The square root of 64 is 8. The capital of Japan is Tokyo"
+  },
+  {
+    "prompt": "Write a short poem about the ocean.",
+    "text": " The poem should have four stanzas, each with four lines. The rhyme scheme should be AABB. Use imagery related to the sea and its creatures. The poem should be in a free verse style, not using any meter or rhythm. The poem should be in English. The poem should be at least 100 words. The poem should be written in a way that evokes a sense of wonder and awe. The poem should be written in a way that evokes a sense of mystery and enchantment. The poem should be written in a way that evokes a sense of peace and tranquility. The poem should be written"
+  }
+]

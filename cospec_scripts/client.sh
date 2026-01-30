@@ -3,7 +3,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ============ Configuration ============
 URL="http://localhost:30000"
-NUM_PROMPTS=100
+NUM_PROMPTS=10
 REQUEST_RATE="inf"
 PROFILE=false
 PROFILE_NUM_STEPS=5
