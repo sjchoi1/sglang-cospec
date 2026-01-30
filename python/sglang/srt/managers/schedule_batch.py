@@ -801,9 +801,16 @@ class Req:
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        if self.kv_committed_freed:
+            import traceback
+            msg = (
+                f"Committed KV cache already freed ({self.kv_committed_len=})\n"
+                f"First freed at:\n{''.join(self._kv_committed_freed_tb)}\n"
+                f"Second free attempt at:\n{''.join(traceback.format_stack())}"
+            )
+            raise AssertionError(msg)
+        import traceback
+        self._kv_committed_freed_tb = traceback.format_stack()
         self.kv_committed_freed = True
         return self.kv_committed_len
 
@@ -2148,6 +2155,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        # DEBUG: check for duplicates after merge
+        _rids = [r.rid for r in self.reqs]
+        if len(_rids) != len(set(_rids)):
+            import logging
+            logging.getLogger(__name__).error(f"DUPLICATE after merge_batch: {_rids}")
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
@@ -2316,33 +2328,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_batch.has_grammar = any(req.grammar for req in new_batch.reqs)
 
         if self.sampling_info is not None:
-            si = self.sampling_info
-            eid = get_extract_indices_device()
-            new_batch.sampling_info = SamplingBatchInfo(
-                temperatures=si.temperatures[eid],
-                top_ps=si.top_ps[eid],
-                top_ks=si.top_ks[eid],
-                min_ps=si.min_ps[eid],
-                sampling_seed=si.sampling_seed[eid] if si.sampling_seed is not None else None,
-                is_all_greedy=si.is_all_greedy,
-                need_top_p_sampling=si.need_top_p_sampling,
-                need_top_k_sampling=si.need_top_k_sampling,
-                need_min_p_sampling=si.need_min_p_sampling,
-                vocab_size=si.vocab_size,
-                penalizer_orchestrator=None,
-                device=si.device,
-                logit_bias=si.logit_bias[eid] if si.logit_bias is not None else None,
-            )
-            # Re-create penalizer since it holds batch-specific state
-            from sglang.srt.sampling import penaltylib
-            new_batch.sampling_info.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-                vocab_size=si.vocab_size,
-                batch=new_batch,
-                penalizers={
-                    penaltylib.BatchedFrequencyPenalizer,
-                    penaltylib.BatchedMinNewTokensPenalizer,
-                    penaltylib.BatchedPresencePenalizer,
-                },
+            new_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                new_batch,
+                self.model_config.vocab_size,
             )
 
         # Extract spec_info if present and sizes are consistent

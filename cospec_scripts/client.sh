@@ -3,7 +3,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ============ Configuration ============
 URL="http://localhost:30000"
-NUM_PROMPTS=10
+NUM_PROMPTS=64
 REQUEST_RATE="inf"
 PROFILE=false
 PROFILE_NUM_STEPS=5
@@ -25,6 +25,7 @@ python -m sglang.bench_serving \
     --dataset-name sharegpt \
     --num-prompts "$NUM_PROMPTS" \
     --request-rate "$REQUEST_RATE" \
+    --extra-request-body '{"temperature": 0}' \
     2>&1 | tee "$SCRIPT_DIR/client.log"
 
 if [ "$PROFILE" = true ]; then

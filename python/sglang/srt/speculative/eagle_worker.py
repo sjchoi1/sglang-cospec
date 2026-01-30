@@ -78,6 +78,15 @@ logger = logging.getLogger(__name__)
 
 class EAGLEWorker(TpModelWorker):
 
+    _allocator_lock_ctx = None
+
+    @property
+    def allocator_lock(self):
+        """No-op by default; ColocatedStandaloneWorker overrides with a real lock."""
+        if self._allocator_lock_ctx is None:
+            self._allocator_lock_ctx = contextlib.nullcontext()
+        return self._allocator_lock_ctx
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -207,8 +216,8 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        # No-op lock by default; colocated worker replaces with a real lock
-        self.allocator_lock = contextlib.nullcontext()
+        # allocator_lock is a property returning nullcontext by default;
+        # colocated worker overrides with a real lock.
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners

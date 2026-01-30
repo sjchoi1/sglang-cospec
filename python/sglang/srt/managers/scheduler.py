@@ -1173,7 +1173,12 @@ class Scheduler(
                 self.process_batch_result(prefill_batch, result)
 
                 # Merge prefill batch into running_batch, then assign to queues
-                prefill_batch.filter_batch()
+                # Exclude chunked requests — they need more prefill rounds
+                # before being assigned to decode queues.
+                chunked_to_exclude = []
+                if self.chunked_req is not None:
+                    chunked_to_exclude.append(self.chunked_req)
+                prefill_batch.filter_batch(chunked_req_to_exclude=chunked_to_exclude)
                 if not prefill_batch.is_empty() and not prefill_batch.is_prefill_only:
                     if self.running_batch.is_empty():
                         self.running_batch = prefill_batch
@@ -1315,6 +1320,12 @@ class Scheduler(
                 self.queue_a.merge_batch(self.running_batch)
 
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # DEBUG: check for duplicates across queues
+        a_rids = set(r.rid for r in self.queue_a.reqs) if not self.queue_a.is_empty() else set()
+        b_rids = set(r.rid for r in self.queue_b.reqs) if not self.queue_b.is_empty() else set()
+        overlap = a_rids & b_rids
+        if overlap:
+            logger.error(f"DUPLICATE across queues after assign: {overlap}")
 
     def _colocated_merge_queues(self) -> ScheduleBatch:
         """Merge both queues into a single batch for fallback."""

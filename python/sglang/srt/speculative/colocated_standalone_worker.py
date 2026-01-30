@@ -135,7 +135,7 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         self.target_stream = torch.cuda.Stream(device=self.device)
 
         # Lock for token_to_kv_pool_allocator (shared between draft and verify)
-        self.allocator_lock = threading.Lock()
+        self._allocator_lock_ctx = threading.Lock()
 
         # SM partitioning: COSPEC_DRAFT_SM_RATIO controls the fraction of
         # TPCs assigned to the draft stream. Set to 0 to disable.
