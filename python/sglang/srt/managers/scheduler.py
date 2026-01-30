@@ -1185,15 +1185,13 @@ class Scheduler(
                 self._colocated_assign_new_reqs()
                 continue
 
-            # 2. Filter finished requests from both queues
-            if not self.queue_a.is_empty():
+            # 2. Filter finished requests from queues without pending spec_info.
+            # Queues with pending spec_info must not be filtered until after
+            # verify, because spec_info indices correspond to the pre-filtered batch.
+            if not self.queue_a.is_empty() and self.queue_a_spec_info is None:
                 self.queue_a.filter_batch(v1_spec_info_filtered=True)
-                if self.queue_a.is_empty():
-                    self.queue_a_spec_info = None
-            if not self.queue_b.is_empty():
+            if not self.queue_b.is_empty() and self.queue_b_spec_info is None:
                 self.queue_b.filter_batch(v1_spec_info_filtered=True)
-                if self.queue_b.is_empty():
-                    self.queue_b_spec_info = None
 
             total_bs = len(self.queue_a.reqs) + len(self.queue_b.reqs)
 
@@ -1294,47 +1292,28 @@ class Scheduler(
             self.queue_b_spec_info = None
 
     def _colocated_assign_new_reqs(self):
-        """After prefill, load-balance new requests across both queues.
-
-        Uses extract_reqs to split the batch. At this point spec_info tensors
-        are freshly created by forward_draft_extend and have correct sizes.
-        """
+        """After prefill, load-balance new requests across both queues."""
         if self.running_batch.is_empty():
             return
 
         n = len(self.running_batch.reqs)
         a_len = len(self.queue_a.reqs)
         b_len = len(self.queue_b.reqs)
-
-        # Compute how many go to each queue to balance sizes
         n_a = max(0, min(n, (n + b_len - a_len) // 2))
-        n_b = n - n_a
 
-        if n_b > 0 and n_a > 0:
-            # Extract n_b reqs into a separate batch for queue_b
-            indices_b = list(range(n_a, n))
-            batch_b = self.running_batch.extract_reqs(indices_b)
-            # running_batch now has only the first n_a reqs
-            if self.queue_a.is_empty():
-                self.queue_a = self.running_batch
-            else:
-                self.queue_a.merge_batch(self.running_batch)
+        if n_a < n:
+            batch_b = self.running_batch.extract_reqs(list(range(n_a, n)))
             if self.queue_b.is_empty():
                 self.queue_b = batch_b
             else:
                 self.queue_b.merge_batch(batch_b)
-        elif n_a > 0:
+
+        if not self.running_batch.is_empty():
             if self.queue_a.is_empty():
                 self.queue_a = self.running_batch
             else:
                 self.queue_a.merge_batch(self.running_batch)
-        else:
-            if self.queue_b.is_empty():
-                self.queue_b = self.running_batch
-            else:
-                self.queue_b.merge_batch(self.running_batch)
 
-        # Clear running_batch
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
 
     def _colocated_merge_queues(self) -> ScheduleBatch:

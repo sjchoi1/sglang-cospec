@@ -275,6 +275,7 @@ class CudaGraphRunner:
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_colocated()
             or model_runner.spec_algorithm.is_ngram()
         ):
             if self.model_runner.is_draft_worker:
@@ -889,6 +890,7 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_colocated()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

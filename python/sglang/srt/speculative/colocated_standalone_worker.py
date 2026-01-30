@@ -10,9 +10,12 @@ Pipeline:
 
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import torch
+import torch.cuda.nvtx as nvtx
 
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -131,44 +134,50 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         self.draft_stream = torch.cuda.Stream(device=self.device)
         self.target_stream = torch.cuda.Stream(device=self.device)
 
-        # Initialize SM controller for partitioning
-        self.sm_ctrl = None
-        self.sm_partition_enabled = False
+        # Lock for token_to_kv_pool_allocator (shared between draft and verify)
+        self.allocator_lock = threading.Lock()
 
-        # Get SM partition ratio from environment or use default
-        draft_ratio = float(os.environ.get("COSPEC_DRAFT_SM_RATIO", "0.2"))
+        # SM partitioning: COSPEC_DRAFT_SM_RATIO controls the fraction of
+        # TPCs assigned to the draft stream. Set to 0 to disable.
+        # Default: 0 (disabled — GPU scheduler handles overlap naturally).
+        draft_ratio = float(os.environ.get("COSPEC_DRAFT_SM_RATIO", "0"))
 
-        try:
-            from sglang.srt.utils.sm_controller import SMController
-            self.sm_ctrl = SMController()
+        if draft_ratio > 0:
+            try:
+                from sglang.srt.utils.sm_controller import SMController
+                sm_ctrl = SMController()
 
-            if self.sm_ctrl.enabled:
-                # Partition SMs: draft gets draft_ratio, target gets the rest
-                draft_tpcs = int(self.sm_ctrl.total_tpcs * draft_ratio)
-                draft_tpcs = max(1, draft_tpcs)  # At least 1 TPC for draft
+                if sm_ctrl.enabled:
+                    draft_tpcs = max(1, int(sm_ctrl.total_tpcs * draft_ratio))
+                    sm_ctrl.set_stream_mask(self.draft_stream, 0, draft_tpcs)
+                    sm_ctrl.set_stream_mask(
+                        self.target_stream, draft_tpcs, sm_ctrl.total_tpcs
+                    )
+                    logger.info(
+                        f"ColocatedWorker: SM partitioning enabled. "
+                        f"Draft: TPCs 0-{draft_tpcs}, Target: TPCs {draft_tpcs}-{sm_ctrl.total_tpcs}"
+                    )
+            except Exception as e:
+                logger.warning(f"ColocatedWorker: SM partitioning failed ({e}).")
+        else:
+            logger.info("ColocatedWorker: SM partitioning disabled (COSPEC_DRAFT_SM_RATIO=0).")
 
-                self.sm_ctrl.set_stream_mask(self.draft_stream, 0, draft_tpcs)
-                self.sm_ctrl.set_stream_mask(
-                    self.target_stream, draft_tpcs, self.sm_ctrl.total_tpcs
-                )
-                self.sm_partition_enabled = True
-                logger.info(
-                    f"ColocatedWorker: SM partitioning enabled. "
-                    f"Draft: TPCs 0-{draft_tpcs}, Target: TPCs {draft_tpcs}-{self.sm_ctrl.total_tpcs}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"ColocatedWorker: SM partitioning disabled ({e}). "
-                f"Falling back to sequential execution with stream overlap."
-            )
+        # Persistent thread pool for dual-batch forward
+        self._thread_pool = ThreadPoolExecutor(max_workers=2)
+
+        # Double-buffer for spec_info to avoid per-step clone
+        self._spec_buf = [None, None]
+        self._spec_buf_idx = 0
 
         logger.info("ColocatedStandaloneWorker initialized")
 
     def _run_verify(self, batch: ScheduleBatch, spec_info) -> GenerationBatchResult:
         """Run verification phase."""
+        nvtx.range_push("verify")
         logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
             self.verify(batch, spec_info)
         )
+        nvtx.range_pop()
 
         # Run draft extend after decode if needed
         with self.draft_tp_context(
@@ -178,18 +187,43 @@ class ColocatedStandaloneWorker(EAGLEWorker):
                 self.server_args.enable_dp_attention
                 or batch.spec_info.verified_id.shape[0] > 0
             ):
+                nvtx.range_push("draft_extend_after_decode")
                 self.forward_draft_extend_after_decode(batch)
+                nvtx.range_pop()
 
-        # Clone spec_info tensors to detach from CUDA graph output buffers.
-        # Without this, the next CUDA graph replay (for a different batch)
-        # would overwrite these shared output buffers.
+        # Double-buffer spec_info tensors to detach from CUDA graph output buffers.
         if batch.spec_info is not None:
+            buf_idx = self._spec_buf_idx
+            self._spec_buf_idx ^= 1
+            buf = self._spec_buf[buf_idx]
+
+            if buf is None:
+                # First time: allocate by cloning
+                buf = {}
+                if batch.spec_info.topk_p is not None:
+                    buf["topk_p"] = batch.spec_info.topk_p.clone()
+                if batch.spec_info.topk_index is not None:
+                    buf["topk_index"] = batch.spec_info.topk_index.clone()
+                if batch.spec_info.hidden_states is not None:
+                    buf["hidden_states"] = batch.spec_info.hidden_states.clone()
+                self._spec_buf[buf_idx] = buf
+            else:
+                # Reuse buffer: copy into pre-allocated tensors (resize if needed)
+                for key in ("topk_p", "topk_index", "hidden_states"):
+                    src = getattr(batch.spec_info, key, None)
+                    if src is None:
+                        continue
+                    if key not in buf or buf[key].shape != src.shape:
+                        buf[key] = src.clone()
+                    else:
+                        buf[key].copy_(src)
+
             if batch.spec_info.topk_p is not None:
-                batch.spec_info.topk_p = batch.spec_info.topk_p.clone()
+                batch.spec_info.topk_p = buf["topk_p"]
             if batch.spec_info.topk_index is not None:
-                batch.spec_info.topk_index = batch.spec_info.topk_index.clone()
+                batch.spec_info.topk_index = buf["topk_index"]
             if batch.spec_info.hidden_states is not None:
-                batch.spec_info.hidden_states = batch.spec_info.hidden_states.clone()
+                batch.spec_info.hidden_states = buf["hidden_states"]
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -200,34 +234,75 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         )
 
     def forward_dual_batch_decode(self, batch_draft, batch_verify, spec_info_verify):
-        """draft(batch_draft) || verify(batch_verify) concurrently on separate streams."""
+        """draft(batch_draft) || verify(batch_verify) concurrently via threads.
+
+        Both threads use separate CUDA streams. The shared allocator is
+        protected by self.allocator_lock — draft() and verify() each acquire
+        it only for the short CPU-side allocator operations.
+        """
+        nvtx.range_push("dual_batch_decode")
         default_stream = torch.cuda.current_stream()
         self.target_stream.wait_stream(default_stream)
         self.draft_stream.wait_stream(default_stream)
 
-        # Launch verify on target_stream
-        with torch.cuda.stream(self.target_stream):
-            verify_result = self._run_verify(batch_verify, spec_info_verify)
+        verify_result_holder = [None]
+        spec_info_holder = [None]
+        exc = [None, None]
 
-        # Launch draft on draft_stream
-        with torch.cuda.stream(self.draft_stream):
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                spec_info = self.draft(batch_draft)
+        def run_verify():
+            try:
+                with torch.cuda.stream(self.target_stream):
+                    nvtx.range_push("target_stream_verify")
+                    verify_result_holder[0] = self._run_verify(
+                        batch_verify, spec_info_verify
+                    )
+                    nvtx.range_pop()
+            except Exception as e:
+                exc[0] = e
 
-        self.draft_stream.synchronize()
-        self.target_stream.synchronize()
+        def run_draft():
+            try:
+                with torch.cuda.stream(self.draft_stream):
+                    nvtx.range_push("draft_stream_draft")
+                    with self.draft_tp_context(
+                        self.draft_model_runner.tp_group
+                    ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                        spec_info_holder[0] = self.draft(batch_draft)
+                    nvtx.range_pop()
+            except Exception as e:
+                exc[1] = e
 
-        return spec_info, verify_result
+        f_verify = self._thread_pool.submit(run_verify)
+        f_draft = self._thread_pool.submit(run_draft)
+        f_verify.result()
+        f_draft.result()
+
+        if exc[0] is not None:
+            raise exc[0]
+        if exc[1] is not None:
+            raise exc[1]
+
+        nvtx.range_push("stream_sync")
+        default_stream.wait_stream(self.draft_stream)
+        default_stream.wait_stream(self.target_stream)
+        nvtx.range_pop()
+
+        nvtx.range_pop()  # dual_batch_decode
+        return spec_info_holder[0], verify_result_holder[0]
 
     def forward_verify_only(self, batch, spec_info):
         """Run verify phase only (when draft queue is empty)."""
-        return self._run_verify(batch, spec_info)
+        nvtx.range_push("verify_only")
+        result = self._run_verify(batch, spec_info)
+        nvtx.range_pop()
+        return result
 
     def forward_draft_only(self, batch):
         """Run draft phase only (first iteration for a queue)."""
+        nvtx.range_push("draft_only")
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            return self.draft(batch)
+            result = self.draft(batch)
+        nvtx.range_pop()
+        return result
