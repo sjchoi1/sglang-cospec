@@ -731,7 +731,9 @@ class Scheduler(
         if self.spec_algorithm.is_colocated():
             self.enable_overlap = False
             self.queue_a: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+            self.queue_a.queue_label = "A"
             self.queue_b: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+            self.queue_b.queue_label = "B"
             self.queue_a_spec_info = None
             self.queue_b_spec_info = None
             self.colocated_phase = 0  # 0 = A drafts/B verifies, 1 = swapped
@@ -1236,12 +1238,9 @@ class Scheduler(
                 continue
 
             # 5. Two-queue concurrent execution
-            a_has_si = self.queue_a_spec_info is not None
-            b_has_si = self.queue_b_spec_info is not None
             logger.info(
                 f"Colocated step: phase={self.colocated_phase}, "
-                f"A(reqs={len(self.queue_a.reqs)}, si={a_has_si}), "
-                f"B(reqs={len(self.queue_b.reqs)}, si={b_has_si})"
+                f"A={len(self.queue_a.reqs)}, B={len(self.queue_b.reqs)}"
             )
             if self.colocated_phase == 0:
                 draft_queue = self.queue_a

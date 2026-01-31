@@ -13,7 +13,7 @@ MEM_FRACTION_STATIC=0.50
 PORT=30000
 # =======================================
 
-COLOCATED_MIN_BATCH_SIZE=1 python -m sglang.launch_server \
+COSPEC_DRAFT_SM_RATIO=0.3 COLOCATED_MIN_BATCH_SIZE=1 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --speculative-algorithm "$SPEC_ALGORITHM" \
     --speculative-draft-model-path "$DRAFT_MODEL_PATH" \

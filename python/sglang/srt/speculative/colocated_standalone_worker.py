@@ -205,14 +205,23 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         logger.info("ColocatedStandaloneWorker initialized")
 
     def _run_verify(self, batch: ScheduleBatch, spec_info) -> GenerationBatchResult:
-        """Run verification phase."""
+        """Run verification phase (verify + post-process only)."""
         nvtx.range_push("verify")
         logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
             self.verify(batch, spec_info)
         )
         nvtx.range_pop()
 
-        # Run draft extend after decode if needed
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=verify_output.verified_id,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _run_draft_extend_after_decode(self, batch: ScheduleBatch):
+        """Run draft extend after decode on the current stream."""
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -224,7 +233,8 @@ class ColocatedStandaloneWorker(EAGLEWorker):
                 self.forward_draft_extend_after_decode(batch)
                 nvtx.range_pop()
 
-        # Double-buffer spec_info tensors to detach from CUDA graph output buffers.
+    def _double_buffer_copy(self, batch: ScheduleBatch):
+        """Double-buffer spec_info tensors to detach from CUDA graph output buffers."""
         if batch.spec_info is not None:
             buf_idx = self._spec_buf_idx
             self._spec_buf_idx ^= 1
@@ -258,22 +268,21 @@ class ColocatedStandaloneWorker(EAGLEWorker):
             if batch.spec_info.hidden_states is not None:
                 batch.spec_info.hidden_states = buf["hidden_states"]
 
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=verify_output.verified_id,
-            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
-            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-
     def forward_dual_batch_decode(self, batch_draft, batch_verify, spec_info_verify):
         """draft(batch_draft) || verify(batch_verify) concurrently via threads.
 
-        Both threads use separate CUDA streams. The shared allocator is
-        protected by self.allocator_lock — draft() and verify() each acquire
-        it only for the short CPU-side allocator operations.
+        Pipeline:
+        1. Thread1: verify(batch_verify) on target_stream
+           Thread2: draft(batch_draft) on draft_stream
+        2. Wait both streams
+        3. draft_extend_after_decode(batch_verify) on default stream
+        4. double_buffer_copy(batch_verify) on default stream
+
+        draft_extend_after_decode runs after the concurrent window on the
+        default stream, avoiding SM contention with the draft() thread.
         """
         nvtx.range_push("dual_batch_decode")
+
         default_stream = torch.cuda.current_stream()
         self.target_stream.wait_stream(default_stream)
         self.draft_stream.wait_stream(default_stream)
@@ -305,6 +314,7 @@ class ColocatedStandaloneWorker(EAGLEWorker):
             except Exception as e:
                 exc[1] = e
 
+        # Step 3: Launch verify and draft concurrently
         f_verify = self._thread_pool.submit(run_verify)
         f_draft = self._thread_pool.submit(run_draft)
         f_verify.result()
@@ -315,10 +325,18 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         if exc[1] is not None:
             raise exc[1]
 
+        # Step 3: Sync streams
         nvtx.range_push("stream_sync")
         default_stream.wait_stream(self.draft_stream)
         default_stream.wait_stream(self.target_stream)
         nvtx.range_pop()
+
+        # Step 4: Run draft_extend_after_decode and double-buffer copy
+        # on the default stream after concurrent section completes.
+        # This removes draft model kernels from the concurrent window,
+        # avoiding SM contention with the draft() thread.
+        self._run_draft_extend_after_decode(batch_verify)
+        self._double_buffer_copy(batch_verify)
 
         nvtx.range_pop()  # dual_batch_decode
         return spec_info_holder[0], verify_result_holder[0]
@@ -327,6 +345,8 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         """Run verify phase only (when draft queue is empty)."""
         nvtx.range_push("verify_only")
         result = self._run_verify(batch, spec_info)
+        self._run_draft_extend_after_decode(batch)
+        self._double_buffer_copy(batch)
         nvtx.range_pop()
         return result
 
