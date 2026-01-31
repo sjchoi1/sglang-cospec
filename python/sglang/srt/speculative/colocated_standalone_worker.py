@@ -36,6 +36,36 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+class _CUDASyncLock:
+    """A context manager that combines a threading lock with CUDA stream synchronization.
+
+    When two threads operate on shared GPU tensors (like the KV pool allocator's
+    free_pages) from different CUDA streams, the Python lock alone is insufficient:
+    GPU operations (e.g., torch.cat in free()) execute asynchronously and a subsequent
+    operation on a different stream may read stale data.
+
+    This lock records a CUDA event when exiting (capturing the last GPU op on the
+    current stream) and waits on it when entering (ensuring the current stream sees
+    all prior GPU ops from whatever stream last held the lock).
+    """
+
+    def __init__(self, device):
+        self._lock = threading.Lock()
+        self._event = torch.cuda.Event()
+        self._device = device
+
+    def __enter__(self):
+        self._lock.acquire()
+        # Wait for GPU ops from the previous holder's stream
+        torch.cuda.current_stream().wait_event(self._event)
+        return self
+
+    def __exit__(self, *args):
+        # Record current stream's progress so the next holder can wait
+        self._event.record(torch.cuda.current_stream())
+        self._lock.release()
+
+
 class ColocatedStandaloneWorker(EAGLEWorker):
     """Pipelined draft/target execution with SM partitioning.
 
@@ -134,8 +164,11 @@ class ColocatedStandaloneWorker(EAGLEWorker):
         self.draft_stream = torch.cuda.Stream(device=self.device)
         self.target_stream = torch.cuda.Stream(device=self.device)
 
-        # Lock for token_to_kv_pool_allocator (shared between draft and verify)
-        self._allocator_lock_ctx = threading.Lock()
+        # Lock for token_to_kv_pool_allocator (shared between draft and verify).
+        # We use a CUDASyncLock that records/waits on CUDA events so that
+        # GPU operations on the shared allocator tensors are properly ordered
+        # across the draft and target streams.
+        self._allocator_lock_ctx = _CUDASyncLock(self.device)
 
         # SM partitioning: COSPEC_DRAFT_SM_RATIO controls the fraction of
         # TPCs assigned to the draft stream. Set to 0 to disable.

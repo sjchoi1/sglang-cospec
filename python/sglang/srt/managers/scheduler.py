@@ -1172,6 +1172,12 @@ class Scheduler(
                 result = self.run_batch(prefill_batch)
                 self.process_batch_result(prefill_batch, result)
 
+                # Stash chunked request: cache its KV in the radix tree and
+                # free its req_pool_idx so tokens are properly tracked.
+                # (In the standard event loop this is done by get_next_batch_to_run.)
+                if self.chunked_req is not None:
+                    self.stash_chunked_request(self.chunked_req)
+
                 # Merge prefill batch into running_batch, then assign to queues
                 # Exclude chunked requests — they need more prefill rounds
                 # before being assigned to decode queues.
@@ -1210,6 +1216,10 @@ class Scheduler(
 
             # 4. Small batch fallback: merge + sequential
             if total_bs < self.colocated_min_bs:
+                logger.info(
+                    f"Colocated fallback: total_bs={total_bs} < min={self.colocated_min_bs}, "
+                    f"A={len(self.queue_a.reqs)}, B={len(self.queue_b.reqs)}"
+                )
                 merged = self._colocated_merge_queues()
                 merged = self.update_running_batch(merged)
                 if merged.is_empty():
@@ -1220,9 +1230,19 @@ class Scheduler(
                 self.last_batch = merged
                 # Split back into two queues
                 self._colocated_split_back(merged)
+                logger.info(
+                    f"Colocated split_back: A={len(self.queue_a.reqs)}, B={len(self.queue_b.reqs)}"
+                )
                 continue
 
             # 5. Two-queue concurrent execution
+            a_has_si = self.queue_a_spec_info is not None
+            b_has_si = self.queue_b_spec_info is not None
+            logger.info(
+                f"Colocated step: phase={self.colocated_phase}, "
+                f"A(reqs={len(self.queue_a.reqs)}, si={a_has_si}), "
+                f"B(reqs={len(self.queue_b.reqs)}, si={b_has_si})"
+            )
             if self.colocated_phase == 0:
                 draft_queue = self.queue_a
                 verify_queue = self.queue_b
@@ -1251,6 +1271,7 @@ class Scheduler(
                 if verify_spec_info is not None:
                     # Just run verify
                     verify_result = self.model_worker.forward_verify_only(verify_queue, verify_spec_info)
+                    verify_queue.queue_label = "B" if self.colocated_phase == 0 else "A"
                     self.process_batch_result(verify_queue, verify_result)
                     if self.colocated_phase == 0:
                         self.queue_b_spec_info = None
@@ -1275,6 +1296,7 @@ class Scheduler(
                 spec_info, verify_result = self.model_worker.forward_dual_batch_decode(
                     draft_queue, verify_queue, verify_spec_info
                 )
+                verify_queue.queue_label = "B" if self.colocated_phase == 0 else "A"
                 self.process_batch_result(verify_queue, verify_result)
                 setattr(self, draft_spec_info_attr, spec_info)
                 # Clear verify queue's spec_info (it was consumed)
@@ -1289,10 +1311,12 @@ class Scheduler(
         """Flush any pending spec_info by running verifies synchronously."""
         if self.queue_a_spec_info is not None and not self.queue_a.is_empty():
             result = self.model_worker.forward_verify_only(self.queue_a, self.queue_a_spec_info)
+            self.queue_a.queue_label = "A"
             self.process_batch_result(self.queue_a, result)
             self.queue_a_spec_info = None
         if self.queue_b_spec_info is not None and not self.queue_b.is_empty():
             result = self.model_worker.forward_verify_only(self.queue_b, self.queue_b_spec_info)
+            self.queue_b.queue_label = "B"
             self.process_batch_result(self.queue_b, result)
             self.queue_b_spec_info = None
 
@@ -1320,12 +1344,6 @@ class Scheduler(
                 self.queue_a.merge_batch(self.running_batch)
 
         self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # DEBUG: check for duplicates across queues
-        a_rids = set(r.rid for r in self.queue_a.reqs) if not self.queue_a.is_empty() else set()
-        b_rids = set(r.rid for r in self.queue_b.reqs) if not self.queue_b.is_empty() else set()
-        overlap = a_rids & b_rids
-        if overlap:
-            logger.error(f"DUPLICATE across queues after assign: {overlap}")
 
     def _colocated_merge_queues(self) -> ScheduleBatch:
         """Merge both queues into a single batch for fallback."""

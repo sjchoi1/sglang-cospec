@@ -801,16 +801,9 @@ class Req:
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        if self.kv_committed_freed:
-            import traceback
-            msg = (
-                f"Committed KV cache already freed ({self.kv_committed_len=})\n"
-                f"First freed at:\n{''.join(self._kv_committed_freed_tb)}\n"
-                f"Second free attempt at:\n{''.join(traceback.format_stack())}"
-            )
-            raise AssertionError(msg)
-        import traceback
-        self._kv_committed_freed_tb = traceback.format_stack()
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
         return self.kv_committed_len
 
@@ -2155,11 +2148,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
-        # DEBUG: check for duplicates after merge
-        _rids = [r.rid for r in self.reqs]
-        if len(_rids) != len(set(_rids)):
-            import logging
-            logging.getLogger(__name__).error(f"DUPLICATE after merge_batch: {_rids}")
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 

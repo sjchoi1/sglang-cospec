@@ -389,13 +389,6 @@ class SchedulerOutputProcessorMixin:
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
-        # DEBUG: check for duplicate requests in batch
-        _seen_rids = set()
-        for _r in batch.reqs:
-            if _r.rid in _seen_rids:
-                logger.error(f"DUPLICATE REQUEST in batch.reqs: rid={_r.rid}, batch has {len(batch.reqs)} reqs, rids={[r.rid for r in batch.reqs]}")
-            _seen_rids.add(_r.rid)
-
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 

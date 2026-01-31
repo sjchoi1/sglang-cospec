@@ -350,7 +350,9 @@ class SchedulerMetricsMixin:
             )
 
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        queue_label = getattr(batch, "queue_label", "")
+        queue_msg = f" {queue_label}" if queue_label else ""
+        msg = f"Decode batch{queue_msg}{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
